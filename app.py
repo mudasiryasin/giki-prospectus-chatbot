@@ -164,8 +164,8 @@ def export_chat_pdf(history):
 
 
 # ---------------- Streamlit App ---------------- #
-st.set_page_config(page_title="Day 5 - Final Chatbot", layout="wide")
-st.title("🤖 GIKI Prospectus Chatbot - Final Version (with LLM Toggle)")
+st.set_page_config(page_title="GIKI Prospectus Q&A Chatbot", layout="wide")
+st.title("🤖 GIKI Prospectus Q&A Chatbot using Retrieval-Augmented Generation (RAG)")
 
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
