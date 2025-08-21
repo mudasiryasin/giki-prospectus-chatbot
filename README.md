@@ -21,5 +21,5 @@ The system retrieves relevant chunks of text and generates answers using **googl
 
 ### 1. Clone the repo
 ```bash
-git clone https://github.com/<your-username>/giki-prospectus-chatbot.git
+git clone https://github.com/mudasiryasin/giki-prospectus-chatbot.git
 cd giki-prospectus-chatbot
