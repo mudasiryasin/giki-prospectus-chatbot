@@ -6,14 +6,12 @@ import streamlit as st
 from typing import List, Dict
 import numpy as np
 from sentence_transformers import SentenceTransformer
-import faiss
 from openai import OpenAI
 from io import BytesIO
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 from googletrans import Translator   # pip install googletrans==4.0.0-rc1
-from transformers import pipeline     # pip install transformers accelerate bitsandbytes
-
+from transformers import pipeline     # pip install transformers
 
 # ---------------- Document Processing ---------------- #
 def extract_text_from_pdf(file_path: str) -> str:
@@ -23,21 +21,17 @@ def extract_text_from_pdf(file_path: str) -> str:
             text += page.get_text("text") + "\n"
     return text
 
-
 def extract_text_from_docx(file_path: str) -> str:
     doc = docx.Document(file_path)
     return "\n".join([para.text for para in doc.paragraphs])
-
 
 def extract_text_from_txt(file_path: str) -> str:
     with open(file_path, "r", encoding="utf-8") as f:
         return f.read()
 
-
 def clean_text(text: str) -> str:
     text = re.sub(r"\s+", " ", text)
     return text.strip()
-
 
 def chunk_text(text: str, chunk_size: int = 400, overlap: int = 50) -> List[str]:
     words = text.split()
@@ -47,14 +41,11 @@ def chunk_text(text: str, chunk_size: int = 400, overlap: int = 50) -> List[str]
         chunks.append(" ".join(chunk))
     return chunks
 
-
 def process_file(uploaded_file) -> List[Dict]:
     ext = os.path.splitext(uploaded_file.name)[-1].lower()
     temp_path = os.path.join("temp_" + uploaded_file.name)
-
     with open(temp_path, "wb") as f:
         f.write(uploaded_file.read())
-
     if ext == ".pdf":
         text = extract_text_from_pdf(temp_path)
     elif ext == ".docx":
@@ -63,73 +54,46 @@ def process_file(uploaded_file) -> List[Dict]:
         text = extract_text_from_txt(temp_path)
     else:
         raise ValueError(f"Unsupported file type: {ext}")
-
     os.remove(temp_path)
     cleaned = clean_text(text)
     chunks = chunk_text(cleaned)
+    return [{"text": chunk, "metadata": {"file": uploaded_file.name, "chunk_number": idx + 1}} 
+            for idx, chunk in enumerate(chunks)]
 
-    chunk_data = []
-    for idx, chunk in enumerate(chunks):
-        chunk_data.append({
-            "text": chunk,
-            "metadata": {
-                "file": uploaded_file.name,
-                "chunk_number": idx + 1
-            }
-        })
-    return chunk_data
-
-
-# ---------------- FAISS Vector Store ---------------- #
-class VectorStoreFAISS:
+# ---------------- Vector Store (In-Memory, NumPy) ---------------- #
+class VectorStore:
     def __init__(self, model_name="all-MiniLM-L6-v2"):
         self.embedder = SentenceTransformer(model_name)
-        self.index = None
-        self.metadata = []
         self.texts = []
+        self.embeddings = []
+        self.metadata = []
 
     def build_index(self, chunks: List[Dict]):
-        texts = [c["text"] for c in chunks]
-        embeddings = self.embedder.encode(texts, convert_to_numpy=True)
-
-        dim = embeddings.shape[1]
-        self.index = faiss.IndexFlatL2(dim)
-        self.index.add(np.array(embeddings).astype("float32"))
+        self.texts = [c["text"] for c in chunks]
+        self.embeddings = self.embedder.encode(self.texts, convert_to_numpy=True)
         self.metadata = [c["metadata"] for c in chunks]
-        self.texts = texts
 
     def search(self, query: str, top_k: int = 3):
         query_emb = self.embedder.encode([query], convert_to_numpy=True)
-        D, I = self.index.search(query_emb.astype("float32"), top_k)
-
-        results = []
-        for idx, dist in zip(I[0], D[0]):
-            if idx != -1:
-                results.append({
-                    "text": self.texts[idx],
-                    "metadata": self.metadata[idx],
-                    "distance": float(dist)
-                })
+        scores = np.dot(self.embeddings, query_emb.T).flatten()  # cosine similarity
+        top_idx = np.argsort(scores)[::-1][:top_k]
+        results = [{"text": self.texts[i], "metadata": self.metadata[i], "score": float(scores[i])} 
+                   for i in top_idx]
         return results
 
-
-# ---------------- RAG Pipeline ---------------- #
+# ---------------- RAG Prompt ---------------- #
 def build_prompt(query: str, retrieved_chunks: List[Dict]) -> str:
     context = "\n\n".join([f"From {c['metadata']['file']} (chunk {c['metadata']['chunk_number']}): {c['text']}" 
                            for c in retrieved_chunks])
-    prompt = f"""
-You are a helpful assistant for answering questions from GIKI documents.
+    return f"""You are a helpful assistant for answering questions from GIKI documents.
 
 Context:
 {context}
 
 Question: {query}
-Answer:
-"""
-    return prompt
+Answer:"""
 
-
-# --- OpenAI GPT (if credits) --- #
+# ---------------- OpenAI GPT ---------------- #
 def generate_answer_openai(prompt: str) -> str:
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     response = client.chat.completions.create(
@@ -139,17 +103,14 @@ def generate_answer_openai(prompt: str) -> str:
     )
     return response.choices[0].message.content
 
-
-# --- HuggingFace Local Model --- #
-# (small model for demo, replace with larger like mistralai/Mistral-7B if GPU available)
+# ---------------- HuggingFace Local ---------------- #
 hf_pipeline = pipeline("text-generation", model="distilgpt2")
 
 def generate_answer_hf(prompt: str) -> str:
     response = hf_pipeline(prompt, max_new_tokens=200, do_sample=True, temperature=0.7)
     return response[0]["generated_text"]
 
-
-# ---------------- Helper: Export Chat as PDF ---------------- #
+# ---------------- Export Chat to PDF ---------------- #
 def export_chat_pdf(history):
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer)
@@ -162,10 +123,9 @@ def export_chat_pdf(history):
     buffer.seek(0)
     return buffer
 
-
 # ---------------- Streamlit App ---------------- #
 st.set_page_config(page_title="GIKI Prospectus Q&A Chatbot", layout="wide")
-st.title("🤖 GIKI Prospectus Q&A Chatbot using Retrieval-Augmented Generation (RAG)")
+st.title("🤖 GIKI Prospectus Q&A Chatbot (No FAISS)")
 
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
@@ -193,9 +153,9 @@ if uploaded_files:
             st.error(f"Error processing {uploaded_file.name}: {e}")
 
     if all_chunks:
-        store = VectorStoreFAISS()
+        store = VectorStore()
         store.build_index(all_chunks)
-        st.success("✅ FAISS index ready")
+        st.success("✅ Vector store ready (in-memory)")
 
         query = st.text_input("🔍 Ask a question about the uploaded documents:")
         if query:
@@ -240,7 +200,7 @@ if uploaded_files:
                 mime="application/pdf"
             )
 
-        # Evaluation feedback
+        # Feedback
         st.subheader("📊 Feedback")
         feedback = st.radio("Was this answer helpful?", ["👍 Yes", "👎 No"], index=None)
         if feedback:
