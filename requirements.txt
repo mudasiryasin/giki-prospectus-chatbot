@@ -5,3 +5,9 @@ faiss-cpu
 tiktoken
 pandas
 numpy
+sentence-transformers
+pymupdf
+python-docx  
+transformers
+torch
+fpdf

@@ -56,12 +56,16 @@ def build_pdf(conversation: List[Dict[str, str]]) -> bytes:
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=12)
     pdf.add_page()
-    pdf.add_font('DejaVu', '', '', uni=True)
+    #pdf.add_font('DejaVu', '', '', uni=True)
+    #pdf.add_font("Urdu", "", "fonts/NotoNastaliqUrdu-Regular.ttf", uni=True)
+    pdf.add_font("Urdu", "", "fonts/static/NotoNastaliqUrdu-Regular.ttf", uni=True)
+
     try:
         pass
     except Exception:
         pass
     pdf.set_font("Arial", size=12)
+    pdf.set_font("Urdu", size=12)
     for turn in conversation:
         role = turn.get("role", "user")
         content = turn.get("content", "")
