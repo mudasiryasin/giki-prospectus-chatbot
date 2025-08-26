@@ -23,10 +23,18 @@ Users can upload up to **5 documents (PDF, DOCX, TXT)**, and the chatbot will ex
 ## 📂 Project Structure
 
 ```
-giki-rag-chatbot/
+giki-prospectus-chatbot/
 ├── app.py # Main chatbot app
 ├── rag_pipeline.py # RAG pipeline
 ├── utils/ # Utilities (text processing, embeddings, retrieval)
+├── fonts/ # English and Urdu fonts
+├── docs/ # Store documents 
+│ └── report/ # Detailed project report and presentation
+│ └── sample_docs/ # Example documents (prospectus, fee structure, etc.)
+│ └── system_architecture/ # System architecture diagram
+├── evaluation/ 
+│ ├── eval.csv # Test Q&A pairs for evaluation 
+│ └── eval_results.json # Model evaluation outputs
 ├── requirements.txt/ # Libraries
 └── README.md
 ```
@@ -48,21 +56,9 @@ Run the chatbot interface:
 streamlit run app.py
 ```
 
-## 🧪 Evaluation
-
-* Place test questions in `evaluation/eval.csv`.
-* Run evaluation:
-   ```
-   python evaluation/eval_runner.py
-   ```
-Results will be saved in `evaluation/eval_results.json`.
-
 ## 📊 Results & Report
 
-Detailed report is available in `docs/report.md`
-.
-It covers:
-
+Detailed report and presentation is available in `docs/report` directory. It covers:
 * Overview
 * Methods
 * Challenges
