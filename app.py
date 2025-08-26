@@ -1,207 +1,229 @@
+from __future__ import annotations
 import os
-import fitz  # PyMuPDF
-import docx
+import io
 import re
-import streamlit as st
-from typing import List, Dict
+import time
+import json
+import math
+from dataclasses import dataclass
+from typing import List, Dict, Any
+from utils.embeddings import load_sentence_model, e5_embed_texts
+from rag_pipeline import ingest_files, answer_question
+from utils.retrieval import init_faiss_index
 import numpy as np
+import pandas as pd
+
+import streamlit as st
+
+# Document parsing
+import fitz  # PyMuPDF
+from docx import Document as DocxDocument
+
+# Embeddings
 from sentence_transformers import SentenceTransformer
-from openai import OpenAI
-from io import BytesIO
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet
-from googletrans import Translator   # pip install googletrans==4.0.0-rc1
-from transformers import pipeline     # pip install transformers
 
-# ---------------- Document Processing ---------------- #
-def extract_text_from_pdf(file_path: str) -> str:
-    text = ""
-    with fitz.open(file_path) as doc:
-        for page in doc:
-            text += page.get_text("text") + "\n"
-    return text
+# Vector DB
+import faiss
 
-def extract_text_from_docx(file_path: str) -> str:
-    doc = docx.Document(file_path)
-    return "\n".join([para.text for para in doc.paragraphs])
+# LLMs
+from transformers import pipeline
 
-def extract_text_from_txt(file_path: str) -> str:
-    with open(file_path, "r", encoding="utf-8") as f:
-        return f.read()
+# PDF export
+from fpdf import FPDF
 
-def clean_text(text: str) -> str:
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+# Optional OpenAI (new SDK style)
+try:
+    from openai import OpenAI  # type: ignore
+except Exception:
+    OpenAI = None  # handled later
 
-def chunk_text(text: str, chunk_size: int = 400, overlap: int = 50) -> List[str]:
-    words = text.split()
-    chunks = []
-    for i in range(0, len(words), chunk_size - overlap):
-        chunk = words[i:i + chunk_size]
-        chunks.append(" ".join(chunk))
-    return chunks
+st.set_page_config(page_title="GIKI Prospectus RAG Chatbot", page_icon="🎓", layout="wide")
 
-def process_file(uploaded_file) -> List[Dict]:
-    ext = os.path.splitext(uploaded_file.name)[-1].lower()
-    temp_path = os.path.join("temp_" + uploaded_file.name)
-    with open(temp_path, "wb") as f:
-        f.write(uploaded_file.read())
-    if ext == ".pdf":
-        text = extract_text_from_pdf(temp_path)
-    elif ext == ".docx":
-        text = extract_text_from_docx(temp_path)
-    elif ext == ".txt":
-        text = extract_text_from_txt(temp_path)
-    else:
-        raise ValueError(f"Unsupported file type: {ext}")
-    os.remove(temp_path)
-    cleaned = clean_text(text)
-    chunks = chunk_text(cleaned)
-    return [{"text": chunk, "metadata": {"file": uploaded_file.name, "chunk_number": idx + 1}} 
-            for idx, chunk in enumerate(chunks)]
+if "index" not in st.session_state:
+    st.session_state.index = None  # FAISS index
+if "meta" not in st.session_state:
+    st.session_state.meta: List[Dict[str, Any]] = []  # metadata per vector id
+if "embed_model_name" not in st.session_state:
+    st.session_state.embed_model_name = "intfloat/multilingual-e5-base"
+if "embed_model" not in st.session_state:
+    st.session_state.embed_model = None
+if "history" not in st.session_state:
+    st.session_state.history: List[Dict[str, str]] = []  # {role: user/assistant, content}
+if "dim" not in st.session_state:
+    st.session_state.dim = None  # embedding dimension
 
-# ---------------- Vector Store (In-Memory, NumPy) ---------------- #
-class VectorStore:
-    def __init__(self, model_name="all-MiniLM-L6-v2"):
-        self.embedder = SentenceTransformer(model_name)
-        self.texts = []
-        self.embeddings = []
-        self.metadata = []
+def build_pdf(conversation: List[Dict[str, str]]) -> bytes:
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=12)
+    pdf.add_page()
+    pdf.add_font('DejaVu', '', '', uni=True)
+    try:
+        pass
+    except Exception:
+        pass
+    pdf.set_font("Arial", size=12)
+    for turn in conversation:
+        role = turn.get("role", "user")
+        content = turn.get("content", "")
+        pdf.multi_cell(0, 6, f"{role.capitalize()}: {content}")
+        pdf.ln(2)
+    return pdf.output(dest='S').encode('latin-1', errors='ignore')
 
-    def build_index(self, chunks: List[Dict]):
-        self.texts = [c["text"] for c in chunks]
-        self.embeddings = self.embedder.encode(self.texts, convert_to_numpy=True)
-        self.metadata = [c["metadata"] for c in chunks]
 
-    def search(self, query: str, top_k: int = 3):
-        query_emb = self.embedder.encode([query], convert_to_numpy=True)
-        scores = np.dot(self.embeddings, query_emb.T).flatten()  # cosine similarity
-        top_idx = np.argsort(scores)[::-1][:top_k]
-        results = [{"text": self.texts[i], "metadata": self.metadata[i], "score": float(scores[i])} 
-                   for i in top_idx]
-        return results
+def download_conversation_buttons():
+    if not st.session_state.history:
+        return
+    # Markdown export
+    md_lines = [f"**{h['role'].capitalize()}:**\n\n{h['content']}" for h in st.session_state.history]
+    md_text = "\n\n---\n\n".join(md_lines)
+    st.download_button("⬇️ Download conversation (Markdown)", data=md_text, file_name="conversation.md", mime="text/markdown")
 
-# ---------------- RAG Prompt ---------------- #
-def build_prompt(query: str, retrieved_chunks: List[Dict]) -> str:
-    context = "\n\n".join([f"From {c['metadata']['file']} (chunk {c['metadata']['chunk_number']}): {c['text']}" 
-                           for c in retrieved_chunks])
-    return f"""You are a helpful assistant for answering questions from GIKI documents.
+    # PDF export
+    pdf_bytes = build_pdf(st.session_state.history)
+    st.download_button("⬇️ Download conversation (PDF)", data=pdf_bytes, file_name="conversation.pdf", mime="application/pdf")
 
-Context:
-{context}
+with st.sidebar:
+    st.header("⚙️ Settings")
 
-Question: {query}
-Answer:"""
-
-# ---------------- OpenAI GPT ---------------- #
-def generate_answer_openai(prompt: str) -> str:
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role": "system", "content": "You are a knowledgeable assistant."},
-                  {"role": "user", "content": prompt}]
+    st.markdown("**Embedding model**")
+    embed_choice = st.selectbox(
+        "Select embedding model",
+        [
+            "intfloat/multilingual-e5-base",
+            "sentence-transformers/all-MiniLM-L6-v2",
+        ],
+        index=0 if st.session_state.embed_model_name == "intfloat/multilingual-e5-base" else 1,
     )
-    return response.choices[0].message.content
 
-# ---------------- HuggingFace Local ---------------- #
-hf_pipeline = pipeline("text-generation", model="distilgpt2")
+    if embed_choice != st.session_state.embed_model_name or st.session_state.embed_model is None:
+        with st.spinner("Loading embedding model..."):
+            st.session_state.embed_model_name = embed_choice
+            st.session_state.embed_model = load_sentence_model(embed_choice)
+            # set dimension
+            dim = st.session_state.embed_model.get_sentence_embedding_dimension()
+            st.session_state.dim = int(dim)
 
-def generate_answer_hf(prompt: str) -> str:
-    response = hf_pipeline(prompt, max_new_tokens=200, do_sample=True, temperature=0.7)
-    return response[0]["generated_text"]
+    st.markdown("**Generator (LLM)**")
+    llm_options = ["OpenAI: gpt-4o-mini", "OpenAI: gpt-4o", "Local: flan-t5-base"]
+    model_choice = st.selectbox("Answering model", llm_options, index=0)
+    temperature = st.slider("Creativity (temperature)", 0.0, 1.0, 0.0, 0.1)
+    top_k = st.slider("Top-k retrieved chunks", 1, 10, 5)
 
-# ---------------- Export Chat to PDF ---------------- #
-def export_chat_pdf(history):
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer)
-    styles = getSampleStyleSheet()
-    story = []
-    for role, msg in history:
-        story.append(Paragraph(f"<b>{role}:</b> {msg}", styles["Normal"]))
-        story.append(Spacer(1, 12))
-    doc.build(story)
-    buffer.seek(0)
-    return buffer
+    st.divider()
+    st.markdown("### 📥 Upload Documents (max 5)")
+    uploaded_files = st.file_uploader(
+        "Upload PDF, DOCX, or TXT files",
+        type=["pdf", "docx", "txt"],
+        accept_multiple_files=True,
+        help="You can upload up to 5 documents",
+    )
+    if uploaded_files and len(uploaded_files) > 5:
+        st.warning("Only the first 5 files will be processed.")
+        uploaded_files = uploaded_files[:5]
 
-# ---------------- Streamlit App ---------------- #
-st.set_page_config(page_title="GIKI Prospectus Q&A Chatbot", layout="wide")
-st.title("🤖 GIKI Prospectus Q&A Chatbot (No FAISS)")
+    colA, colB = st.columns(2)
+    with colA:
+        if st.button("📚 Build / Rebuild Index", use_container_width=True):
+            with st.spinner("Parsing, chunking, embedding, and indexing..."):
+                chunks, metas = ingest_files(uploaded_files or [])
+                if not chunks:
+                    st.error("No text found in uploaded documents.")
+                else:
+                    # embed passages
+                    model = st.session_state.embed_model
+                    vecs = e5_embed_texts(model, chunks, is_query=False)
+                    index = init_faiss_index(vecs.shape[1])
+                    index.add(vecs)
+                    st.session_state.index = index
+                    # attach text to meta and reset store
+                    st.session_state.meta = []
+                    for c, m in zip(chunks, metas):
+                        m = {**m, "text": c}
+                        st.session_state.meta.append(m)
+                    st.success(f"Indexed {len(chunks)} chunks from {len(uploaded_files or [])} file(s).")
+    with colB:
+        if st.button("🧹 Reset Index", type="secondary", use_container_width=True):
+            st.session_state.index = None
+            st.session_state.meta = []
+            st.success("Index cleared.")
 
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+    st.divider()
+    st.markdown("### 📊 Evaluation (optional)")
+    st.caption("Upload CSV with columns: question, expected")
+    eval_file = st.file_uploader("Upload evaluation CSV", type=["csv"], key="eval")
+    if eval_file is not None and st.session_state.index is not None:
+        df = pd.read_csv(eval_file)
+        if not set(["question", "expected"]).issubset(set(df.columns)):
+            st.error("CSV must have columns: question, expected")
+        else:
+            run_eval = st.button("▶️ Run evaluation", use_container_width=True)
+            if run_eval:
+                rows = []
+                for _, row in df.iterrows():
+                    q = str(row["question"])[:2000]
+                    exp = str(row["expected"])[:4000]
+                    ans, metas = answer_question(q, language="English", model_choice=model_choice, k=top_k, temperature=temperature)
+                    # Simple semantic similarity using embedding cosine
+                    vec_true = e5_embed_texts(st.session_state.embed_model, [exp], is_query=False)[0]
+                    vec_pred = e5_embed_texts(st.session_state.embed_model, [ans], is_query=False)[0]
+                    sim = float(np.dot(vec_true, vec_pred))
+                    # Retrieval hit if any chunk contains a 6-word overlap (rough proxy)
+                    def contains_overlap(a: str, b: str, n: int = 6) -> bool:
+                        aw = [w for w in re.findall(r"\w+", a.lower())]
+                        bw = [w for w in re.findall(r"\w+", b.lower())]
+                        aset = {" ".join(aw[i:i+n]) for i in range(max(0, len(aw)-n+1))}
+                        bset = {" ".join(bw[i:i+n]) for i in range(max(0, len(bw)-n+1))}
+                        return len(aset & bset) > 0
+                    hit = any(contains_overlap(exp, m["text"]) for m in metas)
+                    rows.append({
+                        "question": q,
+                        "expected": exp,
+                        "answer": ans,
+                        "semantic_sim": round(sim, 4),
+                        "retrieval_hit": bool(hit),
+                        "sources": "; ".join([f"{m['source']} p.{m['page']}" if m.get('page') else m['source'] for m in metas]),
+                    })
+                out = pd.DataFrame(rows)
+                st.dataframe(out, use_container_width=True)
+                csv = out.to_csv(index=False).encode("utf-8")
+                st.download_button("⬇️ Download evaluation results (CSV)", data=csv, file_name="eval_results.csv", mime="text/csv")
 
-uploaded_files = st.file_uploader(
-    "Upload up to 5 documents (PDF, DOCX, TXT)", 
-    type=["pdf", "docx", "txt"], 
-    accept_multiple_files=True
-)
+st.title("🎓 GIKI Prospectus Q&A — RAG Chatbot")
 
-col1, col2 = st.columns(2)
-with col1:
-    language = st.radio("🌐 Response Language:", ["English", "Urdu"])
-with col2:
-    model_choice = st.radio("🧠 Choose LLM:", ["OpenAI GPT-3.5", "HuggingFace Local"])
+left, right = st.columns([2, 1])
+with right:
+    st.markdown("### 🈯 Language")
+    language = st.radio("Response language", ["English", "Urdu"], index=0, horizontal=True)
+    st.markdown("---")
+    st.markdown("### ⬇️ Downloads")
+    download_conversation_buttons()
 
-if uploaded_files:
-    all_chunks = []
-    for uploaded_file in uploaded_files:
-        try:
-            chunks = process_file(uploaded_file)
-            all_chunks.extend(chunks)
-            st.success(f"Processed {uploaded_file.name} with {len(chunks)} chunks")
-        except Exception as e:
-            st.error(f"Error processing {uploaded_file.name}: {e}")
+with left:
+    st.markdown("#### Chat with your uploaded documents")
+    if st.session_state.index is None or not st.session_state.meta:
+        st.info("Upload up to 5 GIKI-related documents in the sidebar and click **Build / Rebuild Index**.")
 
-    if all_chunks:
-        store = VectorStore()
-        store.build_index(all_chunks)
-        st.success("✅ Vector store ready (in-memory)")
+    # Display chat history
+    for turn in st.session_state.history:
+        with st.chat_message(turn["role"]):
+            st.markdown(turn["content"])
 
-        query = st.text_input("🔍 Ask a question about the uploaded documents:")
-        if query:
-            retrieved = store.search(query, top_k=3)
-            prompt = build_prompt(query, retrieved)
+    # Chat input
+    q = st.chat_input("Ask a question about the uploaded documents…")
+    if q:
+        st.session_state.history.append({"role": "user", "content": q})
+        with st.chat_message("user"):
+            st.markdown(q)
 
-            # Choose LLM
-            if model_choice == "OpenAI GPT-3.5":
-                try:
-                    answer = generate_answer_openai(prompt)
-                except Exception as e:
-                    st.error(f"OpenAI Error: {e}")
-                    st.warning("⚠️ Falling back to HuggingFace local model...")
-                    answer = generate_answer_hf(prompt)
-            else:
-                answer = generate_answer_hf(prompt)
-
-            # Translate if Urdu selected
-            if language == "Urdu":
-                translator = Translator()
-                answer = translator.translate(answer, src="en", dest="ur").text
-
-            # Save to history
-            st.session_state.chat_history.append(("User", query))
-            st.session_state.chat_history.append(("Assistant", answer))
-
-        # Display chat history
-        st.subheader("💬 Chat History")
-        for role, msg in st.session_state.chat_history:
-            if role == "User":
-                st.markdown(f"**🧑 {role}:** {msg}")
-            else:
-                st.markdown(f"**🤖 {role}:** {msg}")
-                st.code(msg)
-
-        if st.session_state.chat_history:
-            pdf_buffer = export_chat_pdf(st.session_state.chat_history)
-            st.download_button(
-                "📥 Download Conversation as PDF",
-                data=pdf_buffer,
-                file_name="chat_history.pdf",
-                mime="application/pdf"
-            )
-
-        # Feedback
-        st.subheader("📊 Feedback")
-        feedback = st.radio("Was this answer helpful?", ["👍 Yes", "👎 No"], index=None)
-        if feedback:
-            st.write("✅ Feedback recorded. Thank you!")
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking…"):
+                ans, metas = answer_question(q, language=language, model_choice=model_choice, k=top_k, temperature=temperature)
+            st.markdown(ans)
+            if metas:
+                with st.expander("Sources"):
+                    for m in metas:
+                        src = m.get("source", "?")
+                        page = m.get("page")
+                        tag = f"{src} (p.{page})" if page else src
+                        st.markdown(f"- **{tag}**\n\n{m['text'][:500]}…")
+        st.session_state.history.append({"role": "assistant", "content": ans})
