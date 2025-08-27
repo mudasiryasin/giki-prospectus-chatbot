@@ -66,6 +66,10 @@ Detailed report and presentation is available in `docs/report` directory. It cov
 * Limitations
 * Future improvements
 
+## 🚀 Deployed Application
+
+You can try out the live app here: [GIKI Prospectus Q&A Chatbot using RAG](https://giki-prospectus-chatbot-4wzwkd4nafxdjovcetqnbe.streamlit.app)
+
 ## 🤝 Contributing
 
 Pull requests are welcome. For major changes, please open an issue first to discuss.
